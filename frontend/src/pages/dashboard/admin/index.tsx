@@ -138,11 +138,10 @@ export default function AdminOverview() {
       </div>
 
       {/* Quick links */}
-      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+      <div className="grid sm:grid-cols-2 gap-4">
         {[
           { href: '/dashboard/admin/users', icon: UserIcon, label: 'Пользователи', desc: 'Управление аккаунтами и балансами', iconBg: 'bg-blue-100 text-blue-600' },
           { href: '/dashboard/admin/tickets', icon: AlertIcon, label: 'Заявки', desc: 'Баги, обращения, обратная связь', iconBg: 'bg-red-100 text-red-600' },
-          { href: '/dashboard/settings', icon: ChartIcon, label: 'Настройки', desc: 'Профиль и API ключи', iconBg: 'bg-purple-100 text-purple-600' },
         ].map(({ href, icon: Icon, label, desc, iconBg }) => (
           <Link
             key={href}
