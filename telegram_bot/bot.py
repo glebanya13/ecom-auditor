@@ -1,356 +1,389 @@
 """
-Telegram Bot for E-Com Auditor 2026
-Commands: /report, /check_legal, /products, /help
+Telegram Bot — E-Com Auditor 2026
+Pulls live data from the backend API (no direct DB access).
+
+Env vars:
+  TELEGRAM_BOT_TOKEN  — bot token from @BotFather
+  BOT_API_URL         — backend base URL (default: http://backend:8000)
+  BOT_SECRET          — shared secret for /api/v1/bot/* endpoints
+  WEB_URL             — public frontend URL for links in messages
 """
-import asyncio
 import logging
+import os
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
+import httpx
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
-    CommandHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
     MessageHandler,
-    filters
+    filters,
 )
-import os
-import sys
 
-# Add parent directory to path for imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# ── Config ────────────────────────────────────────────────────────────────────
 
-from backend.app.core.config import settings
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+API_URL = os.environ.get("BOT_API_URL", "http://backend:8000")
+BOT_SECRET = os.environ.get("BOT_SECRET", "")
+WEB_URL = os.environ.get("WEB_URL", "http://31.59.139.73")
 
-# Setup logging
+_HEADERS = {"X-Bot-Secret": BOT_SECRET}
+
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
 
-class EComAuditorBot:
-    """E-Com Auditor Telegram Bot"""
+# ── Backend API client ────────────────────────────────────────────────────────
 
-    def __init__(self, token: str):
-        self.token = token
-        self.application = Application.builder().token(token).build()
-        self._setup_handlers()
+async def _api(method: str, path: str, **kwargs):
+    """Make a request to the backend bot API. Returns parsed JSON or None."""
+    url = f"{API_URL}/api/v1/bot{path}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await getattr(client, method)(url, headers=_HEADERS, **kwargs)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        logger.warning("API %s %s → %s", method.upper(), path, exc)
+        return None
 
-    def _setup_handlers(self):
-        """Setup command and message handlers"""
 
-        # Commands
-        self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(CommandHandler("help", self.help_command))
-        self.application.add_handler(CommandHandler("report", self.report_command))
-        self.application.add_handler(CommandHandler("check_legal", self.check_legal_command))
-        self.application.add_handler(CommandHandler("products", self.products_command))
-        self.application.add_handler(CommandHandler("settings", self.settings_command))
+async def get_user(tid: str):
+    return await _api("get", "/user", params={"telegram_id": tid})
 
-        # Callback handlers
-        self.application.add_handler(CallbackQueryHandler(self.handle_callback))
 
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
+async def get_products(tid: str):
+    return await _api("get", "/products", params={"telegram_id": tid})
 
-        welcome_message = """
-🚀 <b>Добро пожаловать в E-Com Auditor 2026!</b>
 
-Система комплексного аудита для селлеров на маркетплейсах.
+async def get_report(tid: str):
+    return await _api("get", "/report", params={"telegram_id": tid})
 
-<b>Основные возможности:</b>
-✅ Проверка юридического комплаенса (ФЗ-289)
-✅ Аудит ранжирования и SEO
-✅ Финансовый анализ с НДС 22%
-✅ Генерация юридических документов
-✅ Мониторинг 24/7
 
-<b>Команды:</b>
-/report - Отчет по прибыли за день
-/check_legal - Проверка готовности к ФНС
-/products - Список ваших товаров
-/settings - Настройки уведомлений
-/help - Помощь
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-Для начала работы привяжите свой аккаунт через веб-интерфейс:
-https://ecom-auditor.ru
-"""
+def _risk_icon(p: dict) -> str:
+    score = p.get("last_score")
+    critical = p.get("shadow_ban_detected") or p.get("certificate_expired") or p.get("marking_issues")
+    if critical or (score is not None and score < 50):
+        return "🔴"
+    if score is None or score < 75:
+        return "🟡"
+    return "🟢"
 
+
+def _mp_icon(mp: str) -> str:
+    return "🟣 WB" if mp == "wildberries" else "🔵 Ozon"
+
+
+def _not_linked(tid: str) -> tuple:
+    """Message + keyboard for unlinked user."""
+    text = (
+        "🔗 <b>Аккаунт не привязан</b>\n\n"
+        f"Ваш Telegram ID: <code>{tid}</code>\n\n"
+        "Как привязать:\n"
+        f"1. Войдите на <a href='{WEB_URL}/dashboard/settings'>сайт → Настройки</a>\n"
+        "2. Введите этот ID в поле «Telegram ID»\n"
+        "3. Нажмите «Сохранить» и напишите /start"
+    )
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⚙️ Открыть Настройки", url=f"{WEB_URL}/dashboard/settings")]]
+    )
+    return text, kb
+
+
+# ── /start ────────────────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = str(update.effective_user.id)
+    user = await get_user(tid)
+
+    if not user:
+        text, kb = _not_linked(tid)
         await update.message.reply_text(
-            welcome_message,
-            parse_mode='HTML'
+            text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True
         )
+        return
 
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /help command"""
+    name = user.get("full_name") or user.get("email", "").split("@")[0]
+    sub = "✅ Активна" if user.get("subscription_active") else "🆓 Бесплатный план"
+    report = await get_report(tid) or {}
+    total = report.get("total", 0)
 
-        help_text = """
-📚 <b>Справка по командам</b>
+    await update.message.reply_text(
+        f"👋 <b>Привет, {name}!</b>\n\n"
+        f"📦 Товаров под мониторингом: <b>{total}</b>\n"
+        f"💳 Подписка: {sub}\n\n"
+        "<b>Команды:</b>\n"
+        "/report — сводка по всем товарам\n"
+        "/products — список товаров\n"
+        "/check_legal — проверка комплаенса\n"
+        "/help — справка",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌐 Открыть дашборд", url=f"{WEB_URL}/dashboard")],
+        ]),
+    )
 
-<b>/report</b> - Мгновенный отчет по прибыли
-Показывает:
-• Выручка за день
-• Чистая прибыль с учетом НДС 22%
-• Топ-3 товара
-• Проблемные позиции
 
-<b>/check_legal</b> - Проверка документов
-Проверяет:
-• Актуальность сертификатов
-• Соответствие маркировки
-• Готовность к проверке ФНС
+# ── /help ─────────────────────────────────────────────────────────────────────
 
-<b>/products</b> - Список товаров
-Отображает все отслеживаемые товары с индикацией рисков:
-🟢 Зеленый - всё хорошо
-🟡 Желтый - требует внимания
-🔴 Красный - критические проблемы
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📚 <b>Справка</b>\n\n"
+        "/start — главный экран\n"
+        "/report — сводка: сколько товаров 🟢🟡🔴\n"
+        "/products — полный список товаров\n"
+        "/check_legal — статус сертификатов и маркировки\n"
+        "/settings — настройки аккаунта\n\n"
+        "🔔 <b>Автоуведомления бота:</b>\n"
+        "• Просроченный / приостановленный сертификат\n"
+        "• Теневой бан (резкое падение позиций)\n"
+        "• Проблемы с маркировкой (Честный Знак)\n"
+        "• Превышение лимита УСН\n\n"
+        f"🌐 {WEB_URL}",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
-<b>/settings</b> - Настройки
-Управление уведомлениями и алертами
 
-<b>Автоматические уведомления:</b>
-⚠️ Приостановка сертификата
-⚠️ Принудительная акция (требует решения)
-⚠️ Резкое падение позиций
-⚠️ Превышение лимита УСН
+# ── /report ───────────────────────────────────────────────────────────────────
 
-По вопросам: support@ecom-auditor.ru
-"""
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = str(update.effective_user.id)
+    user = await get_user(tid)
+    if not user:
+        text, kb = _not_linked(tid)
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        return
 
-        await update.message.reply_text(help_text, parse_mode='HTML')
+    msg = await update.message.reply_text("⏳ Загружаю данные…")
+    report = await get_report(tid)
 
-    async def report_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /report command - daily profit report"""
+    if not report:
+        await msg.edit_text("❌ Не удалось получить данные. Попробуйте позже.")
+        return
 
-        # Mock data - in production, fetch from API
-        report = """
-📊 <b>Отчет за сегодня</b> ({date})
-
-💰 <b>Финансы:</b>
-Выручка: 145,600 ₽
-Расходы: 98,340 ₽
-НДС 22%: 26,384 ₽
-<b>Чистая прибыль: 20,876 ₽</b>
-
-📦 <b>Топ-3 товара:</b>
-1. SKU-12345 | 12,400 ₽
-2. SKU-67890 | 8,200 ₽
-3. SKU-11111 | 6,100 ₽
-
-⚠️ <b>Проблемы:</b>
-• SKU-54321: Падение позиций (-15)
-• SKU-99999: Низкий рейтинг (4.2)
-
-Полный отчет в PDF:
-[Скачать отчет]
-""".format(date=datetime.now().strftime("%d.%m.%Y"))
-
-        keyboard = [
-            [InlineKeyboardButton("📥 Скачать PDF", callback_data="download_report")],
-            [InlineKeyboardButton("📈 Детальная аналитика", callback_data="detailed_analytics")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await update.message.reply_text(
-            report,
-            parse_mode='HTML',
-            reply_markup=reply_markup
+    total = report["total"]
+    if total == 0:
+        await msg.edit_text(
+            "📦 <b>Товаров пока нет</b>\n\n"
+            f"Добавьте или импортируйте товары в <a href='{WEB_URL}/dashboard'>дашборде</a>.",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
         )
+        return
 
-    async def check_legal_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /check_legal command - legal compliance check"""
+    green = report["green"]
+    yellow = report["yellow"]
+    red = report["red"]
+    health = round((green / total) * 100)
+    critical = report.get("critical", [])
 
-        legal_check = """
-⚖️ <b>Проверка юридического комплаенса</b>
+    text = (
+        f"📊 <b>Сводка</b> — {datetime.now().strftime('%d.%m %H:%M')}\n\n"
+        f"📦 Товаров: <b>{total}</b>\n"
+        f"🟢 {green}  🟡 {yellow}  🔴 {red}\n"
+        f"Здоровье каталога: <b>{health}%</b>"
+    )
+    if critical:
+        text += "\n\n⚠️ <b>Требуют внимания:</b>\n" + "\n".join(f"• {c}" for c in critical)
+    if not user.get("subscription_active"):
+        text += f"\n\n💳 <a href='{WEB_URL}/dashboard/settings'>Подписка</a> — мониторинг 24/7"
 
-<b>Сертификаты и декларации:</b>
-✅ 12 товаров - сертификаты действительны
-⚠️ 2 товара - истекает через 30 дней
-❌ 1 товар - сертификат приостановлен
+    await msg.edit_text(
+        text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Список товаров", callback_data="cb_products")],
+            [InlineKeyboardButton("🌐 Дашборд", url=f"{WEB_URL}/dashboard")],
+        ]),
+    )
 
-<b>Маркировка "Честный ЗНАК":</b>
-✅ Соответствие остатков: 98%
-⚠️ 15 кодов требуют проверки
 
-<b>НДС и УСН:</b>
-✅ Оборот в пределах лимита (78%)
-Использовано: 206,844,000 из 265,800,000 ₽
+# ── /products ─────────────────────────────────────────────────────────────────
 
-<b>Готовность к проверке ФНС:</b>
-🟢 Высокая (92/100)
+async def cmd_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _send_products(update.message, str(update.effective_user.id))
 
-<b>Рекомендации:</b>
-1. Продлить сертификат SKU-54321
-2. Обновить коды маркировки (список ↓)
-3. Подготовить документы на случай проверки
-"""
 
-        keyboard = [
-            [InlineKeyboardButton("📄 Список проблемных товаров", callback_data="problem_products")],
-            [InlineKeyboardButton("📋 Сгенерировать документы", callback_data="generate_legal_docs")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+async def _send_products(msg_obj, tid: str):
+    user = await get_user(tid)
+    if not user:
+        text, kb = _not_linked(tid)
+        await msg_obj.reply_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        return
 
-        await update.message.reply_text(
-            legal_check,
-            parse_mode='HTML',
-            reply_markup=reply_markup
+    products = await get_products(tid)
+    if products is None:
+        await msg_obj.reply_text("❌ Ошибка при получении данных.")
+        return
+
+    if not products:
+        await msg_obj.reply_text(
+            f"📦 Товаров нет. <a href='{WEB_URL}/dashboard'>Добавьте через дашборд</a>.",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
         )
+        return
 
-    async def products_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /products command - list products"""
+    lines = [f"📦 <b>Товары ({len(products)})</b>\n"]
+    for p in products[:15]:
+        icon = _risk_icon(p)
+        mp = _mp_icon(p.get("marketplace", ""))
+        name = (p.get("name") or p.get("sku_id") or "—")[:28]
+        score_str = f" {int(p['last_score'])}/100" if p.get("last_score") is not None else ""
+        price_str = f" · {int(p['current_price'])} ₽" if p.get("current_price") else ""
+        lines.append(f"{icon} {mp} {name}{score_str}{price_str}")
 
-        products_list = """
-📦 <b>Ваши товары (15)</b>
+    if len(products) > 15:
+        lines.append(f"\n<i>ещё {len(products) - 15} товаров на сайте</i>")
 
-🟢 SKU-12345 | Кроссовки Nike
-   Оценка: 92/100 | Позиция: #8
+    await msg_obj.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌐 Открыть все товары", url=f"{WEB_URL}/dashboard/products")],
+        ]),
+    )
 
-🟢 SKU-67890 | Футболка Adidas
-   Оценка: 88/100 | Позиция: #12
 
-🟡 SKU-11111 | Рюкзак Puma
-   Оценка: 67/100 | Позиция: #45
-   ⚠️ Медленная доставка
+# ── /check_legal ──────────────────────────────────────────────────────────────
 
-🔴 SKU-54321 | Кепка Reebok
-   Оценка: 42/100 | Позиция: #156
-   ❌ Сертификат приостановлен
-   ⚠️ Низкий рейтинг (4.1)
+async def cmd_check_legal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = str(update.effective_user.id)
+    user = await get_user(tid)
+    if not user:
+        text, kb = _not_linked(tid)
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        return
 
-🟡 SKU-99999 | Носки Nike
-   Оценка: 71/100 | Позиция: #32
-   ⚠️ Проблемы с маркировкой
+    msg = await update.message.reply_text("⏳ Проверяю юридический статус…")
+    products = await get_products(tid)
 
-<i>+ еще 10 товаров</i>
-"""
+    if products is None:
+        await msg.edit_text("❌ Ошибка при получении данных.")
+        return
 
-        keyboard = [
-            [InlineKeyboardButton("🔍 Аудит всех товаров", callback_data="audit_all")],
-            [InlineKeyboardButton("⚙️ Добавить товар", callback_data="add_product")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await update.message.reply_text(
-            products_list,
-            parse_mode='HTML',
-            reply_markup=reply_markup
+    if not products:
+        await msg.edit_text(
+            f"📦 Нет товаров для проверки.\n<a href='{WEB_URL}/dashboard'>Добавьте товары</a>.",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
         )
+        return
 
-    async def settings_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /settings command"""
+    total = len(products)
+    cert_bad = sum(1 for p in products if p.get("certificate_expired"))
+    marking_bad = sum(1 for p in products if p.get("marking_issues"))
+    shadow_ban = sum(1 for p in products if p.get("shadow_ban_detected"))
+    cert_ok = total - cert_bad
+    marking_ok = total - marking_bad
 
-        settings_text = """
-⚙️ <b>Настройки уведомлений</b>
+    score = round(((cert_ok + marking_ok) / (total * 2)) * 100)
 
-<b>Текущие настройки:</b>
+    text = (
+        "⚖️ <b>Юридический комплаенс</b>\n\n"
+        "<b>Сертификаты (Росаккредитация):</b>\n"
+        f"  ✅ Действительны: {cert_ok}\n"
+        f"  ❌ Проблемы: {cert_bad}\n\n"
+        "<b>Маркировка (Честный Знак):</b>\n"
+        f"  ✅ Без проблем: {marking_ok}\n"
+        f"  ⚠️ Нарушения: {marking_bad}\n"
+    )
+    if shadow_ban:
+        text += f"\n🚫 Теневой бан: {shadow_ban} товар(а)\n"
 
-📊 Ежедневный отчет: ✅ Включен (9:00)
-⚠️ Критические алерты: ✅ Включен
-📉 Падение позиций: ✅ Включен (>20 позиций)
-💰 Принудительные акции: ✅ Включен
-📜 Изменения в оферте: ✅ Включен
-🔔 Истечение сертификатов: ✅ Включен (за 30 дней)
+    text += f"\n<b>Готовность к ФНС: {score}/100</b>"
 
-<b>Частота проверок:</b>
-Основная: каждые 6 часов
-Быстрая: каждый час
-"""
+    # Show problem list (max 5)
+    problems = [p for p in products if p.get("certificate_expired") or p.get("marking_issues") or p.get("shadow_ban_detected")]
+    if problems:
+        text += "\n\n<b>Проблемные товары:</b>"
+        for p in problems[:5]:
+            issues = []
+            if p.get("certificate_expired"):
+                issues.append("сертификат ❌")
+            if p.get("marking_issues"):
+                issues.append("маркировка ⚠️")
+            if p.get("shadow_ban_detected"):
+                issues.append("теневой бан 🚫")
+            label = (p.get("name") or p.get("sku_id") or "—")[:25]
+            text += f"\n• {label} — {', '.join(issues)}"
 
-        keyboard = [
-            [InlineKeyboardButton("📊 Изменить время отчета", callback_data="change_report_time")],
-            [InlineKeyboardButton("🔕 Отключить уведомления", callback_data="disable_notifications")],
-            [InlineKeyboardButton("⚙️ Расширенные настройки", callback_data="advanced_settings")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+    await msg.edit_text(
+        text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Перейти к товарам", url=f"{WEB_URL}/dashboard/products")],
+        ]),
+    )
 
-        await update.message.reply_text(
-            settings_text,
-            parse_mode='HTML',
-            reply_markup=reply_markup
-        )
 
-    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle button callbacks"""
+# ── /settings ─────────────────────────────────────────────────────────────────
 
-        query = update.callback_query
-        await query.answer()
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = str(update.effective_user.id)
+    user = await get_user(tid)
+    sub = "✅ Активна" if (user and user.get("subscription_active")) else "🆓 Бесплатный план"
 
-        callback_data = query.data
+    await update.message.reply_text(
+        "⚙️ <b>Настройки</b>\n\n"
+        f"Telegram ID: <code>{tid}</code>\n"
+        f"Подписка: {sub}\n\n"
+        "Управление API ключами, профилем и подпиской — на сайте.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Открыть Настройки", url=f"{WEB_URL}/dashboard/settings")],
+        ]),
+    )
 
-        if callback_data == "download_report":
-            await query.message.reply_text(
-                "📥 Генерирую PDF-отчет...\n\nОтчет будет отправлен через несколько секунд."
-            )
-            # In production: generate and send actual PDF
 
-        elif callback_data == "detailed_analytics":
-            await query.message.reply_text(
-                "📈 Детальная аналитика доступна в веб-интерфейсе:\nhttps://ecom-auditor.ru/analytics"
-            )
+# ── Callback buttons ──────────────────────────────────────────────────────────
 
-        elif callback_data == "problem_products":
-            await query.message.reply_text(
-                "📄 <b>Товары с проблемами:</b>\n\n"
-                "1. SKU-54321 - Сертификат приостановлен\n"
-                "2. SKU-99999 - Проблема с маркировкой\n"
-                "3. SKU-77777 - Истекает сертификат (через 15 дней)",
-                parse_mode='HTML'
-            )
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tid = str(query.from_user.id)
 
-        elif callback_data == "generate_legal_docs":
-            keyboard = [
-                [InlineKeyboardButton("📝 Претензия по ФЗ-289", callback_data="complaint_289")],
-                [InlineKeyboardButton("⚖️ Жалоба в ФАС", callback_data="fas_complaint")],
-                [InlineKeyboardButton("📋 Ответ на требование ФНС", callback_data="fns_response")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+    if query.data == "cb_products":
+        await _send_products(query.message, tid)
 
-            await query.message.reply_text(
-                "Выберите тип документа:",
-                reply_markup=reply_markup
-            )
 
-        elif callback_data == "audit_all":
-            await query.message.reply_text(
-                "🔍 Запускаю полный аудит всех товаров...\n\n"
-                "Это займет 2-3 минуты. Результаты будут отправлены в этот чат."
-            )
+# ── Unknown command ───────────────────────────────────────────────────────────
 
-        else:
-            await query.message.reply_text(
-                "Функция в разработке. Используйте веб-интерфейс для полного доступа."
-            )
+async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Неизвестная команда. /help — список команд.")
 
-    async def send_alert(self, chat_id: int, alert_type: str, message: str):
-        """Send alert notification to user"""
 
-        alert_icons = {
-            "certificate_suspended": "🚨",
-            "position_drop": "📉",
-            "forced_promo": "💸",
-            "offer_change": "📜",
-            "usn_limit": "⚠️"
-        }
+# ── Main ──────────────────────────────────────────────────────────────────────
 
-        icon = alert_icons.get(alert_type, "⚠️")
-        alert_message = f"{icon} <b>ВАЖНОЕ УВЕДОМЛЕНИЕ</b>\n\n{message}"
+def main():
+    application = Application.builder().token(TOKEN).build()
 
-        await self.application.bot.send_message(
-            chat_id=chat_id,
-            text=alert_message,
-            parse_mode='HTML'
-        )
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("report", cmd_report))
+    application.add_handler(CommandHandler("products", cmd_products))
+    application.add_handler(CommandHandler("check_legal", cmd_check_legal))
+    application.add_handler(CommandHandler("settings", cmd_settings))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
 
-    def run(self):
-        """Start the bot"""
-        logger.info("Starting E-Com Auditor Bot...")
-        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Bot started (polling)…")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    bot = EComAuditorBot(settings.TELEGRAM_BOT_TOKEN)
-    bot.run()
+    main()

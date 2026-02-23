@@ -39,8 +39,10 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
     # Telegram
-    TELEGRAM_BOT_TOKEN: str
+    TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_WEBHOOK_URL: str = ""
+    # Secret used by the Telegram bot to authenticate requests to /bot/* endpoints
+    BOT_SECRET: str = ""
 
     # Marketplace APIs
     WILDBERRIES_API_KEY: str = ""

@@ -9,7 +9,7 @@ from slowapi.errors import RateLimitExceeded
 
 from .core.config import settings
 from .core.rate_limit import limiter
-from .api import auth, products, audit, legal, admin
+from .api import auth, products, audit, legal, admin, bot
 
 # ---------------------------------------------------------------------------
 # App factory
@@ -54,6 +54,7 @@ app.include_router(audit.router, prefix=f"{settings.API_V1_PREFIX}/audit", tags=
 app.include_router(legal.router, prefix=f"{settings.API_V1_PREFIX}/legal", tags=["Legal Documents"])
 app.include_router(admin.router, prefix=f"{settings.API_V1_PREFIX}/admin", tags=["Admin"])
 app.include_router(admin.payments_router, prefix=f"{settings.API_V1_PREFIX}", tags=["Payments"])
+app.include_router(bot.router, prefix=f"{settings.API_V1_PREFIX}/bot", tags=["Bot"])
 
 
 # ---------------------------------------------------------------------------

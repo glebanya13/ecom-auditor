@@ -67,6 +67,23 @@ services:
       - ecom_network
     restart: unless-stopped
 
+  # ── Telegram Bot ─────────────────────────────────────────────────────────────
+  telegram_bot:
+    build:
+      context: ./telegram_bot
+      dockerfile: Dockerfile
+    container_name: ecom_auditor_bot
+    depends_on:
+      - backend
+    env_file:
+      - .env
+    environment:
+      - BOT_API_URL=http://backend:8000
+      - WEB_URL=http://31.59.139.73
+    networks:
+      - ecom_network
+    restart: unless-stopped
+
   # ── Nginx (reverse proxy) ────────────────────────────────────────────────────
   nginx:
     image: nginx:alpine
