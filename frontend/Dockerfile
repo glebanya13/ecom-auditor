@@ -33,8 +33,8 @@ COPY --from=builder --chown=nextjs:nodejs /app/.next      ./.next
 COPY --from=builder                       /app/node_modules ./node_modules
 COPY --from=builder                       /app/package.json ./package.json
 
-# Copy public assets if they exist
-COPY --from=builder /app/public ./public 2>/dev/null || true
+# Copy public assets
+COPY --from=builder --chown=nextjs:nodejs /app/public ./public
 
 USER nextjs
 EXPOSE 3000
