@@ -17,6 +17,7 @@ interface User {
   balance: number;
   subscription_active: boolean;
   telegram_id: string | null;
+  is_verified: boolean;
 }
 
 function SuccessBanner({ message }: { message: string }) {
@@ -75,6 +76,7 @@ export default function Settings() {
       })
       .then((data: User | null) => {
         if (!data) return;
+        if (data.is_verified) { router.push('/dashboard/admin'); return; }
         setUser(data);
         setProfileName(data.full_name || '');
         setTelegramId(data.telegram_id || '');

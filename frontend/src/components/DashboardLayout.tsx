@@ -32,7 +32,7 @@ export default function DashboardLayout({ title, children, activeNav }: Dashboar
       .catch(() => {});
   }, []);
 
-  const navItems = userNavItems;
+  const navItems = isAdmin ? userNavItems.filter(item => item.key !== 'settings') : userNavItems;
 
   const handleLogout = () => {
     localStorage.removeItem('access_token');
