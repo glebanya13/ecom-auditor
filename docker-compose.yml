@@ -1,83 +1,83 @@
 services:
-  # PostgreSQL Database
+
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
   db:
     image: postgres:14-alpine
     container_name: ecom_auditor_db
     environment:
-      POSTGRES_USER: ${DB_USER:-ecom_user}
+      POSTGRES_USER:     ${DB_USER:-ecom_user}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
-      POSTGRES_DB: ${DB_NAME:-ecom_auditor}
+      POSTGRES_DB:       ${DB_NAME:-ecom_auditor}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
     networks:
       - ecom_network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-ecom_user} -d ${DB_NAME:-ecom_auditor}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  # Redis (for caching and task queue)
+  # ── Redis ────────────────────────────────────────────────────────────────────
   redis:
     image: redis:6-alpine
     container_name: ecom_auditor_redis
-    ports:
-      - "6379:6379"
     networks:
       - ecom_network
     restart: unless-stopped
 
-  # Backend API
+  # ── Backend API (FastAPI) ────────────────────────────────────────────────────
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: ecom_auditor_backend
     depends_on:
-      - db
-      - redis
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    env_file:
+      - .env
     environment:
       - DATABASE_URL=postgresql://${DB_USER:-ecom_user}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-ecom_auditor}
       - REDIS_URL=redis://redis:6379
-    env_file:
-      - .env
     volumes:
       - ./backend:/app
-      - ./reports:/app/reports
-    ports:
-      - "8000:8000"
     networks:
       - ecom_network
     restart: unless-stopped
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
 
-  # Telegram Bot
-    #telegram_bot:
-      #build:
-        #context: ./telegram_bot
-        #dockerfile: Dockerfile
-     # container_name: ecom_auditor_bot
-      #depends_on:
-       # - backend
-        #- db
-      #env_file:
-       # - .env
-      #volumes:
-       # - ./telegram_bot:/app
-      #networks:
-       # - ecom_network
-      #restart: unless-stopped
+  # ── Frontend (Next.js) ───────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - BACKEND_URL=http://backend:8000
+    container_name: ecom_auditor_frontend
+    environment:
+      - BACKEND_URL=http://backend:8000
+      - NODE_ENV=production
+    depends_on:
+      - backend
+    networks:
+      - ecom_network
+    restart: unless-stopped
 
-  # Nginx (reverse proxy)
+  # ── Nginx (reverse proxy) ────────────────────────────────────────────────────
   nginx:
     image: nginx:alpine
     container_name: ecom_auditor_nginx
     depends_on:
       - backend
+      - frontend
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./frontend:/usr/share/nginx/html:ro
     ports:
       - "80:80"
-      - "443:443"
     networks:
       - ecom_network
     restart: unless-stopped
